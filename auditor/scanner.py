@@ -30,6 +30,7 @@ class Finding:
     file: str
     line: int
     evidence: str
+    explanation: str
     impact: str
     recommendation: str
 
@@ -43,8 +44,27 @@ RULES = [
     ("debug-enabled", "medium", "Security", "Debug mode may be enabled", re.compile(r"(?i)(?:DEBUG\s*[:=]\s*True|debug\s*:\s*true|debug\s*=\s*true)"), "Detailed errors or development behavior may be exposed in a deployed environment.", "Disable debug mode in production and set it through an environment-specific configuration."),
     ("wildcard-cors", "medium", "Security", "Wildcard cross-origin policy", re.compile(r"(?i)(?:Access-Control-Allow-Origin\s*[:=]\s*['\"]\*|cors\s*\(\s*\{?\s*origin\s*:\s*['\"]\*)"), "Any website may be allowed to make cross-origin requests to this service.", "Restrict allowed origins to the specific trusted sites that need access."),
     ("unsafe-yaml", "high", "Security", "Potentially unsafe YAML deserialization", re.compile(r"\byaml\.load\s*\("), "Unsafe YAML loading can instantiate objects or execute code from untrusted documents, depending on the loader.", "Use a safe loader for untrusted YAML and validate the resulting data."),
+    ("unsafe-pickle", "high", "Security", "Unsafe Python pickle deserialization", re.compile(r"\bpickle\.(?:load|loads)\s*\("), "Python pickle data can execute code while it is being deserialized. Loading attacker-controlled or tampered pickle data can therefore run code with the application's privileges.", "Do not unpickle data from untrusted sources. Prefer a data-only format such as JSON, and authenticate any serialized data that must be trusted."),
     ("weak-hash", "low", "Security", "Weak hash algorithm used", re.compile(r"(?i)(?:hashlib\.(?:md5|sha1)|createHash\s*\(\s*['\"](?:md5|sha1)|MessageDigest\.getInstance\s*\(\s*['\"](?:MD5|SHA-1))"), "MD5 and SHA-1 are unsuitable for collision-resistant security uses.", "Use a modern cryptographic hash for integrity, and a password hashing scheme for passwords."),
 ]
+
+EXPLANATIONS = {
+    "secret": "A string assigned to a credential-like variable matched the secret heuristic. This can be a real token or a harmless example, so inspect the value without copying it into the report or sharing it. If it was ever a real credential, rotate it even after removing it from the current file.",
+    "sql-concat": "The query call appears to build SQL from concatenated or interpolated text. If any inserted value can come from a request, file, environment, or other untrusted input, an attacker may alter the query's meaning.",
+    "eval": "This call evaluates text as code at runtime. If the evaluated text can be influenced by an external input, it may allow arbitrary code execution; even trusted inputs can make behavior difficult to audit.",
+    "shell-true": "A process is launched through a command shell. Shell parsing interprets metacharacters, so interpolating untrusted input into the command can turn data into extra commands or arguments.",
+    "tls-disabled": "The client appears to skip certificate validation. Without validation, an attacker on the network may impersonate the server and read or alter traffic.",
+    "debug-enabled": "A configuration value appears to enable debug behavior. In production, debug pages and verbose errors can reveal internal paths, configuration, or request data.",
+    "wildcard-cors": "The cross-origin policy appears to allow every website. This can expose browser-accessible responses to unrelated origins, especially when the service also accepts credentials or sensitive requests.",
+    "unsafe-yaml": "The code calls the general YAML loader. Some loader modes construct language objects, so parsing attacker-controlled YAML can become unsafe; confirm the loader version and options used.",
+    "unsafe-pickle": "Pickle is a Python object serialization format, not a safe interchange format. Deserialization can execute code, so only load data whose source and integrity are fully trusted.",
+    "weak-hash": "MD5 or SHA-1 appears in a hashing call. These algorithms have known collision weaknesses; whether that matters depends on whether the hash protects integrity, identity, or password storage.",
+    "todo": "A TODO, FIXME, XXX, or HACK comment marks work that may be incomplete or a known defect. The scanner cannot tell whether it is still relevant or tracked elsewhere.",
+    "not-implemented": "This code path explicitly raises or throws an unimplemented error. If users or another component can reach it, the intended operation will fail at runtime.",
+    "credential-literal": "A credential-like literal matched a lower-confidence pattern. It may be a test value or placeholder; verify its origin and rotate it if it was ever a live secret.",
+    "empty-function": "The function body contains only a pass statement (possibly after a docstring), so calling it currently has no effect. This may be intentional for an interface stub, but can also hide unfinished behavior.",
+    "duplicate-line": "The same long line appears twice in this file. This heuristic does not prove the code is duplicated incorrectly; inspect whether both copies should stay in sync or whether shared logic would be clearer.",
+}
 
 
 def iter_files(root: Path) -> Iterable[Path]:
@@ -187,9 +207,10 @@ def scan(root: str | Path) -> dict:
     findings: list[Finding] = []
     scanned = 0
 
-    def add(rule: str, severity: str, category: str, title: str, path: Path, line: int, evidence: str, impact: str, recommendation: str) -> None:
+    def add(rule: str, severity: str, category: str, title: str, path: Path, line: int, evidence: str, impact: str, recommendation: str, explanation: str | None = None) -> None:
         rel = path.relative_to(base).as_posix()
-        findings.append(Finding(f"{rule}:{rel}:{line}", severity, category, title, rel, line, evidence.strip()[:220], impact, recommendation))
+        detail = explanation or EXPLANATIONS.get(rule) or f"The scanner matched this line against its {title.lower()} heuristic. Treat this as a review prompt, not proof of a vulnerability. Check whether the code path is reachable and whether the application's framework or surrounding validation already provides a safeguard."
+        findings.append(Finding(f"{rule}:{rel}:{line}", severity, category, title, rel, line, evidence.strip()[:220], detail, impact, recommendation))
 
     for path in iter_files(base):
         try:
@@ -221,7 +242,11 @@ def scan(root: str | Path) -> dict:
                             body = body[1:]
                         if len(body) == 1 and isinstance(body[0], ast.Pass):
                             add("empty-function", "medium", "Implementation gap", f"Empty function: {node.name}", path, node.lineno, f"def {node.name}(…): pass", "The function currently performs no work and may silently leave a feature incomplete.", "Implement the function, or raise a clear exception if it is intentionally unsupported.")
-            except (SyntaxError, ValueError):
+            except SyntaxError as exc:
+                syntax_line = max(1, exc.lineno or 1)
+                excerpt = (lines[syntax_line - 1].strip() if syntax_line <= len(lines) else "")
+                add("python-syntax", "medium", "Code quality", "Python syntax error", path, syntax_line, f"{exc.msg}: {excerpt}".strip(), "Python cannot import or execute this file while the syntax error remains. This can cause application startup failures or break tests that import the module.", "Inspect the reported line and nearby indentation, delimiters, strings, and operator usage. Run `python -m py_compile <file>` after correcting it.", "Python's parser rejected this file before execution. The line is where parsing detected the problem; the actual typo may be on that line or immediately before it.")
+            except ValueError:
                 pass
 
     # Only report exact repeated non-trivial lines; avoid common syntax and blank lines.
@@ -262,7 +287,7 @@ def to_markdown(report: dict) -> str:
         out.append("No findings from the enabled checks.")
     for i, f in enumerate(report["findings"], 1):
         evidence = f["evidence"].replace("`", "\\`")
-        out += [f"## {i}. [{f['severity'].upper()}] {f['title']}", "", f"- **Category:** {f['category']}", f"- **Location:** `{f['file']}:{f['line']}`", f"- **Evidence:** `{evidence}`", f"- **Impact:** {f['impact']}", f"- **Recommendation:** {f['recommendation']}", ""]
+        out += [f"## {i}. [{f['severity'].upper()}] {f['title']}", "", f"- **Category:** {f['category']}", f"- **Location:** `{f['file']}:{f['line']}`", f"- **Evidence:** `{evidence}`", f"- **What this means:** {f.get('explanation', 'Review the evidence and surrounding code to confirm whether this heuristic applies.')}", f"- **Why it matters:** {f['impact']}", f"- **Recommended fix:** {f['recommendation']}", ""]
     out += ["---", "Heuristic static analysis is imperfect. Review findings in context; this report is not a guarantee that the code is secure."]
     return "\n".join(out)
 
