@@ -1,6 +1,7 @@
 {
-  "title": "RepoSleuth — Codebase Security & Quality Scanner",
-  "description": "RepoSleuth scans project folders for potential security risks, code quality issues, and unfinished work. It applies static analysis rules across common languages and project structures, then creates clear, severity-ranked reports to help developers understand findings and prioritize fixes.",
-  "track": "AI triage",
-  "repository": "https://github.com/praneeth-0107/RepoSleuth"
+  "language": "python",
+  "install": "python -m pip install -r requirements.txt",
+  "test": "python -m unittest discover -v",
+  "start": "python -m auditor web --host 0.0.0.0 --port 8000",
+  "port": 8000
 }
